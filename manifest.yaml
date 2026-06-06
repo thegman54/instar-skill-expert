@@ -1,0 +1,11 @@
+name: expert
+display_name: Expert
+description: Structured expert knowledge base — procedures, runbooks, and domain-specific instructions with on-demand retrieval
+category: Core
+icon: academic-cap
+color: amber
+version: 0.1.0
+database: true
+
+admin_panel: admin.html
+admin_label: Knowledge
