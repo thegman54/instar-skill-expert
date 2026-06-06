@@ -1,6 +1,7 @@
 name: expert
 display_name: Expert
 description: Structured expert knowledge base — procedures, runbooks, and domain-specific instructions with on-demand retrieval
+type: expert
 category: Core
 icon: academic-cap
 color: amber
