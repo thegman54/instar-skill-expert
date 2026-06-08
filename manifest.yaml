@@ -10,3 +10,4 @@ database: true
 
 admin_panel: admin.html
 admin_label: Knowledge
+admin_api: admin_api.py
