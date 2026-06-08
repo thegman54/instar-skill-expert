@@ -1,5 +1,5 @@
 """
-Expert skill — admin API routes for proposals CRUD.
+Expert skill — admin API routes for entries CRUD and proposals.
 
 These routes are loaded by the tool-executor when the manifest declares
 `admin_api: admin_api.py`. The gatekeeper proxies requests from
@@ -9,11 +9,122 @@ Handler signature: async handler(pool, body=None, **regex_groups)
 Returns: dict (JSON response). Use __status key for non-200 status codes.
 """
 
-import json
 import structlog
 
 log = structlog.get_logger()
 
+
+# =============================================================================
+# ENTRIES CRUD
+# =============================================================================
+
+async def list_entries(pool, body=None, slug=None, **kw):
+    """List all expert entries for a profile."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, topic, category, summary, content, priority, tags, refs,
+                      created_at, updated_at
+               FROM expert_entries
+               WHERE profile_slug = $1
+               ORDER BY category, priority DESC, topic""",
+            slug,
+        )
+    return {
+        "entries": [
+            {
+                "id": str(r["id"]),
+                "topic": r["topic"],
+                "category": r["category"],
+                "summary": r["summary"],
+                "content": r["content"],
+                "priority": r["priority"],
+                "tags": list(r["tags"]) if r["tags"] else [],
+                "refs": list(r["refs"]) if r["refs"] else [],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+async def create_entry(pool, body=None, slug=None, **kw):
+    """Create a new expert entry."""
+    if not body:
+        return {"__status": 400, "detail": "Request body required"}
+
+    topic = (body.get("topic") or "").strip()
+    category = (body.get("category") or "").strip()
+    summary = (body.get("summary") or "").strip()
+    content = (body.get("content") or "").strip()
+    priority = body.get("priority", "normal")
+    tags = body.get("tags", [])
+    refs = body.get("refs", [])
+
+    if not topic or not category or not summary or not content:
+        return {"__status": 400, "detail": "topic, category, summary, and content are required"}
+
+    async with pool.acquire() as conn:
+        try:
+            row = await conn.fetchrow(
+                """INSERT INTO expert_entries
+                   (profile_slug, topic, category, summary, content, priority, tags, refs)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                   RETURNING id""",
+                slug, topic, category, summary, content, priority, tags, refs,
+            )
+        except Exception as e:
+            if "unique" in str(e).lower():
+                return {"__status": 409, "detail": f"Topic '{topic}' already exists for this profile"}
+            raise
+
+    return {"id": str(row["id"]), "topic": topic}
+
+
+async def update_entry(pool, body=None, slug=None, entry_id=None, **kw):
+    """Update an existing expert entry."""
+    if not body:
+        return {"__status": 400, "detail": "Request body required"}
+
+    updates = []
+    params = []
+    idx = 3  # $1 = entry_id, $2 = profile_slug
+    for field in ["category", "summary", "content", "priority"]:
+        if field in body:
+            updates.append(f"{field} = ${idx}")
+            params.append(body[field])
+            idx += 1
+    if "tags" in body:
+        updates.append(f"tags = ${idx}")
+        params.append(body["tags"])
+        idx += 1
+    if "refs" in body:
+        updates.append(f"refs = ${idx}")
+        params.append(body["refs"])
+        idx += 1
+    if not updates:
+        return {"__status": 400, "detail": "No fields to update"}
+
+    updates.append("updated_at = now()")
+    sql = f"UPDATE expert_entries SET {', '.join(updates)} WHERE id = $1::uuid AND profile_slug = $2"
+    async with pool.acquire() as conn:
+        await conn.execute(sql, entry_id, slug, *params)
+    return {"id": entry_id, "updated": True}
+
+
+async def delete_entry(pool, body=None, slug=None, entry_id=None, **kw):
+    """Delete an expert entry."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM expert_entries WHERE id = $1::uuid AND profile_slug = $2",
+            entry_id, slug,
+        )
+    return {"deleted": True}
+
+
+# =============================================================================
+# PROPOSALS
+# =============================================================================
 
 async def list_proposals(pool, body=None, slug=None, **kw):
     """List pending expert proposals for a profile."""
@@ -73,7 +184,6 @@ async def approve_proposal(pool, body=None, slug=None, proposal_id=None, **kw):
         if not row:
             return {"__status": 404, "detail": "Proposal not found or already resolved"}
 
-        # Upsert the expert entry (works for both create and update)
         await conn.execute(
             """INSERT INTO expert_entries
                (profile_slug, topic, category, summary, content, priority, tags, refs)
@@ -91,7 +201,6 @@ async def approve_proposal(pool, body=None, slug=None, proposal_id=None, **kw):
             row["tags"] or [], row["refs"] or [],
         )
 
-        # Mark proposal as approved
         await conn.execute(
             """UPDATE expert_proposals SET status = 'approved', resolved_at = now()
                WHERE id = $1::uuid""",
@@ -114,12 +223,19 @@ async def reject_proposal(pool, body=None, slug=None, proposal_id=None, **kw):
     return {"rejected": True}
 
 
-# Route table — loaded by tool-executor's _load_skill_api()
-# Pattern format: regex matched against the remainder path after /skill_api/{skill_name}/
-# Named groups become kwargs to the handler.
+# =============================================================================
+# ROUTE TABLE
+# =============================================================================
+
 routes = [
-    ("GET",  r"/(?P<slug>[\w-]+)/proposals$",                                list_proposals),
-    ("GET",  r"/(?P<slug>[\w-]+)/proposals/count$",                          count_proposals),
-    ("POST", r"/(?P<slug>[\w-]+)/proposals/(?P<proposal_id>[\w-]+)/approve$", approve_proposal),
-    ("POST", r"/(?P<slug>[\w-]+)/proposals/(?P<proposal_id>[\w-]+)/reject$",  reject_proposal),
+    # Entries CRUD
+    ("GET",    r"/(?P<slug>[\w-]+)/entries$",                                   list_entries),
+    ("POST",   r"/(?P<slug>[\w-]+)/entries$",                                   create_entry),
+    ("PUT",    r"/(?P<slug>[\w-]+)/entries/(?P<entry_id>[\w-]+)$",              update_entry),
+    ("DELETE", r"/(?P<slug>[\w-]+)/entries/(?P<entry_id>[\w-]+)$",              delete_entry),
+    # Proposals
+    ("GET",    r"/(?P<slug>[\w-]+)/proposals$",                                 list_proposals),
+    ("GET",    r"/(?P<slug>[\w-]+)/proposals/count$",                           count_proposals),
+    ("POST",   r"/(?P<slug>[\w-]+)/proposals/(?P<proposal_id>[\w-]+)/approve$", approve_proposal),
+    ("POST",   r"/(?P<slug>[\w-]+)/proposals/(?P<proposal_id>[\w-]+)/reject$",  reject_proposal),
 ]
