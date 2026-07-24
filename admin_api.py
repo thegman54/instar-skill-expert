@@ -9,9 +9,13 @@ Handler signature: async handler(pool, body=None, **regex_groups)
 Returns: dict (JSON response). Use __status key for non-200 status codes.
 """
 
+import json
+import os
 import structlog
 
 log = structlog.get_logger()
+
+_SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # =============================================================================
@@ -224,6 +228,211 @@ async def reject_proposal(pool, body=None, slug=None, proposal_id=None, **kw):
 
 
 # =============================================================================
+# EXPERT LEARNING — Analyze conversation transcripts → proposals
+# =============================================================================
+
+ENHANCER_SYSTEM_PROMPT = """\
+You are an Expert Knowledge Curator. Your job is to analyze conversation transcripts \
+and improve a bot's expert knowledge base by proposing precise, actionable entries.
+
+You will receive:
+1. The current expert knowledge entries (what the bot already knows)
+2. A conversation transcript (what actually happened)
+
+Your task:
+- Identify knowledge gaps: where did the bot struggle, give wrong info, or miss context?
+- Identify improvements: where could existing entries be clearer, more complete, or better structured?
+- Identify new topics: what knowledge would have helped but doesn't exist yet?
+
+For each proposal, output a JSON object in the "proposals" array with these fields:
+- "action": "create" (new topic) or "update" (improve existing)
+- "topic": short kebab-case identifier (e.g. "api-auth-flow", "error-handling-timeouts")
+- "category": logical grouping (e.g. "api", "workflow", "troubleshooting")
+- "summary": one-line description of what this entry covers
+- "content": the full knowledge entry in markdown — procedures, examples, gotchas
+- "priority": "low", "normal", "high", or "critical"
+- "tags": array of searchable keywords
+- "refs": array of related topic names (cross-references)
+- "rationale": why this change improves the bot's capabilities (reference the transcript)
+
+If an entry already exists and just needs refinement, use action "update" and include \
+the improved full content (not a diff).
+
+Respond with ONLY a JSON object: {"proposals": [...]}
+No commentary, no markdown fences, just the JSON.\
+"""
+
+
+async def learn_from_transcript(pool, body=None, slug=None, credentials=None, **kw):
+    """
+    Analyze a conversation transcript against current expert knowledge.
+    Calls Claude API directly to produce proposals, writes them to expert_proposals.
+    """
+    if not body:
+        return {"__status": 400, "detail": "Request body required"}
+
+    transcript = (body.get("transcript") or "").strip()
+    conversation_id = body.get("conversation_id", "")
+    if not transcript:
+        return {"__status": 400, "detail": "transcript is required"}
+
+    # Fetch API key from credentials (passed by tool-executor)
+    api_key = None
+    if credentials:
+        try:
+            creds = await credentials.get_credentials("expert_learn", ["ANTHROPIC_API_KEY"])
+            api_key = creds.get("ANTHROPIC_API_KEY")
+        except Exception as e:
+            log.warning("learn_credential_fetch_failed", error=str(e))
+
+    if not api_key:
+        return {"__status": 503, "detail": "ANTHROPIC_API_KEY not available"}
+
+    # Load current expert entries for context
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT topic, category, summary, content, priority, tags, refs
+               FROM expert_entries
+               WHERE profile_slug = $1
+               ORDER BY category, topic""",
+            slug,
+        )
+
+    entries_context = ""
+    if rows:
+        entry_lines = []
+        for r in rows:
+            entry_lines.append(
+                f"### {r['topic']} ({r['category']})\n"
+                f"**Summary:** {r['summary']}\n"
+                f"**Priority:** {r['priority']}\n"
+                f"**Tags:** {', '.join(r['tags']) if r['tags'] else 'none'}\n\n"
+                f"{r['content']}\n"
+            )
+        entries_context = "\n---\n".join(entry_lines)
+    else:
+        entries_context = "(No expert entries exist yet — all proposals will be creates)"
+
+    user_message = (
+        f"## Current Expert Knowledge ({len(rows)} entries)\n\n"
+        f"{entries_context}\n\n"
+        f"---\n\n"
+        f"## Conversation Transcript\n\n"
+        f"{transcript}"
+    )
+
+    # Call Claude API
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 8192,
+                    "system": ENHANCER_SYSTEM_PROMPT,
+                    "messages": [{"role": "user", "content": user_message}],
+                },
+                timeout=120.0,
+            )
+    except Exception as e:
+        log.error("learn_api_call_failed", error=str(e))
+        return {"__status": 502, "detail": f"Claude API call failed: {e}"}
+
+    if resp.status_code != 200:
+        log.error("learn_api_error", status=resp.status_code, body=resp.text[:500])
+        return {"__status": 502, "detail": f"Claude API returned {resp.status_code}"}
+
+    # Parse response
+    result = resp.json()
+    text = ""
+    for block in result.get("content", []):
+        if block.get("type") == "text":
+            text += block["text"]
+
+    try:
+        parsed = json.loads(text)
+        proposals = parsed.get("proposals", [])
+    except json.JSONDecodeError:
+        log.error("learn_parse_failed", text=text[:500])
+        return {"__status": 502, "detail": "Claude returned invalid JSON"}
+
+    if not proposals:
+        return {"proposals_created": 0, "message": "No improvements identified"}
+
+    # Write proposals to DB
+    created = 0
+    async with pool.acquire() as conn:
+        for p in proposals:
+            topic = (p.get("topic") or "").strip()
+            if not topic:
+                continue
+
+            # For updates, capture existing content for side-by-side diff
+            existing_content = None
+            if p.get("action") == "update":
+                row = await conn.fetchrow(
+                    "SELECT content FROM expert_entries WHERE profile_slug = $1 AND topic = $2",
+                    slug, topic,
+                )
+                if row:
+                    existing_content = row["content"]
+
+            await conn.execute(
+                """INSERT INTO expert_proposals
+                   (profile_slug, action, topic, category, summary, content,
+                    priority, tags, refs, rationale, existing_content,
+                    status, conversation_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12)""",
+                slug,
+                p.get("action", "create"),
+                topic,
+                p.get("category", "general"),
+                p.get("summary", ""),
+                p.get("content", ""),
+                p.get("priority", "normal"),
+                p.get("tags", []),
+                p.get("refs", []),
+                p.get("rationale", ""),
+                existing_content,
+                conversation_id,
+            )
+            created += 1
+
+    log.info("learn_proposals_created", slug=slug, count=created, conversation_id=conversation_id)
+    return {"proposals_created": created}
+
+
+# =============================================================================
+# LEARN INSTRUCTIONS — read/write instructions_learn.md
+# =============================================================================
+
+async def get_learn_instructions(pool, body=None, **kw):
+    """Read the learn instructions file."""
+    path = os.path.join(_SKILL_DIR, 'instructions_learn.md')
+    if os.path.isfile(path):
+        with open(path, 'r') as f:
+            return {"content": f.read()}
+    return {"content": ""}
+
+
+async def save_learn_instructions(pool, body=None, **kw):
+    """Write the learn instructions file."""
+    if not body or "content" not in body:
+        return {"__status": 400, "detail": "content is required"}
+    path = os.path.join(_SKILL_DIR, 'instructions_learn.md')
+    with open(path, 'w') as f:
+        f.write(body["content"])
+    log.info("learn_instructions_saved", skill="expert", chars=len(body["content"]))
+    return {"saved": True}
+
+
+# =============================================================================
 # ROUTE TABLE
 # =============================================================================
 
@@ -238,4 +447,9 @@ routes = [
     ("GET",    r"/(?P<slug>[\w-]+)/proposals/count$",                           count_proposals),
     ("POST",   r"/(?P<slug>[\w-]+)/proposals/(?P<proposal_id>[\w-]+)/approve$", approve_proposal),
     ("POST",   r"/(?P<slug>[\w-]+)/proposals/(?P<proposal_id>[\w-]+)/reject$",  reject_proposal),
+    # Learning
+    ("POST",   r"/(?P<slug>[\w-]+)/learn$",                                    learn_from_transcript),
+    # Learn instructions
+    ("GET",    r"/learn-instructions$",                                         get_learn_instructions),
+    ("PUT",    r"/learn-instructions$",                                         save_learn_instructions),
 ]

@@ -8,11 +8,28 @@
 
     <!-- Header -->
     <div class="flex items-center justify-between mb-4">
-        <div>
-            <h3 class="text-lg font-semibold text-white">Expert Knowledge</h3>
-            <div class="flex items-center gap-3">
-                <span class="text-xs font-mono text-gray-400" x-text="slug"></span>
-                <span class="text-xs text-gray-500" x-text="entries.length + ' entries across ' + Object.keys(categories).length + ' categories'"></span>
+        <div class="flex items-center gap-3">
+            <!-- Avatar -->
+            <div class="relative group cursor-pointer" @click="$refs.avatarInput.click()">
+                <div class="w-12 h-12 rounded-full overflow-hidden ring-2 ring-amber-500/30 flex items-center justify-center bg-gray-900"
+                    :class="avatarUrl ? '' : 'text-amber-400 text-lg font-bold'">
+                    <img x-show="avatarUrl" :src="avatarUrl" class="w-full h-full object-cover" />
+                    <span x-show="!avatarUrl">E</span>
+                </div>
+                <div class="absolute inset-0 rounded-full bg-black/50 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
+                    <svg class="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M6.827 6.175A2.31 2.31 0 0 1 5.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 0 0-1.134-.175 2.31 2.31 0 0 1-1.64-1.055l-.822-1.316a2.192 2.192 0 0 0-1.736-1.039 48.774 48.774 0 0 0-5.232 0 2.192 2.192 0 0 0-1.736 1.039l-.821 1.316Z" />
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 12.75a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0Z" />
+                    </svg>
+                </div>
+                <input type="file" x-ref="avatarInput" accept="image/*" class="hidden" @change="uploadAvatar($event)" />
+            </div>
+            <div>
+                <h3 class="text-lg font-semibold text-white">Expert Knowledge</h3>
+                <div class="flex items-center gap-3">
+                    <span class="text-xs font-mono text-gray-400" x-text="slug"></span>
+                    <span class="text-xs text-gray-500" x-text="entries.length + ' entries across ' + Object.keys(categories).length + ' categories'"></span>
+                </div>
             </div>
         </div>
         <div class="flex items-center gap-2">
@@ -29,6 +46,11 @@
                 <span x-show="proposalCount > 0"
                     class="absolute -top-1.5 -right-1.5 bg-emerald-500 text-white text-[10px] font-bold rounded-full h-4 min-w-[16px] flex items-center justify-center px-1"
                     x-text="proposalCount"></span>
+            </button>
+            <button @click="activeTab = 'learn'; loadLearnInstructions()"
+                class="px-3 py-1.5 text-xs rounded transition-colors"
+                :class="activeTab === 'learn' ? 'bg-indigo-700 text-white' : 'text-gray-400 hover:text-white bg-gray-700'">
+                Learn
             </button>
             <button x-show="activeTab === 'entries'" @click="startCreate()"
                 class="px-3 py-1.5 text-xs bg-amber-700 hover:bg-amber-600 text-white rounded transition-colors">+ New Entry</button>
@@ -98,6 +120,30 @@
                     </div>
                 </div>
             </template>
+        </div>
+    </div>
+
+    <!-- Learn Instructions Tab -->
+    <div x-show="activeTab === 'learn'" x-cloak class="flex-1 min-h-0 flex flex-col">
+        <div class="mb-3">
+            <p class="text-xs text-gray-400 mb-1">
+                These instructions are sent to the bot when the cockpit learn button is clicked.
+                They guide how conversation transcripts are analyzed and what expert proposals to generate.
+            </p>
+            <p class="text-[10px] text-gray-600">File: <code>instructions_learn.md</code></p>
+        </div>
+        <textarea x-model="learnInstructions" rows="20"
+            class="flex-1 w-full px-3 py-2 bg-gray-900 border border-gray-600 rounded text-white text-xs font-mono focus:border-indigo-500 focus:outline-none resize-y leading-relaxed"
+            placeholder="# Learn Instructions&#10;&#10;Write markdown instructions for how the bot should analyze transcripts..."></textarea>
+        <div class="flex items-center justify-between mt-3">
+            <span class="text-[10px] text-gray-600" x-text="learnInstructions.length + ' chars'"></span>
+            <div class="flex items-center gap-2">
+                <span x-show="learnSaveStatus" class="text-xs" :class="learnSaveStatus === 'saved' ? 'text-emerald-400' : 'text-red-400'" x-text="learnSaveStatus === 'saved' ? 'Saved' : learnSaveStatus"></span>
+                <button @click="saveLearnInstructions()"
+                    class="px-4 py-1.5 text-xs bg-indigo-700 hover:bg-indigo-600 text-white rounded transition-colors">
+                    Save
+                </button>
+            </div>
         </div>
     </div>
 
@@ -238,6 +284,8 @@
 function expertAdmin() {
     return {
         slug: '',
+        skillName: '',
+        avatarUrl: null,
         entries: [],
         proposals: [],
         proposalCount: 0,
@@ -247,13 +295,45 @@ function expertAdmin() {
         editingId: null,
         formError: null,
         form: { topic: '', category: '', summary: '', content: '', priority: 'normal', tags: '', refs: '' },
+        learnInstructions: '',
+        learnSaveStatus: null,
 
         init() {
-            this.slug = this.$el.closest('[data-admin-slug]')?.dataset.adminSlug || '';
+            const container = this.$el.closest('[data-admin-slug]');
+            this.slug = container?.dataset.adminSlug || '';
+            this.skillName = container?.dataset.adminSkill || '';
             if (this.slug) {
                 this.loadEntries();
                 this.loadProposalCount();
             }
+            if (this.skillName) this.loadAvatar();
+        },
+
+        loadAvatar() {
+            const img = new Image();
+            img.onload = () => { this.avatarUrl = `/api/skills/${this.skillName}/avatar`; };
+            img.src = `/api/skills/${this.skillName}/avatar`;
+        },
+
+        async uploadAvatar(event) {
+            const file = event.target.files?.[0];
+            if (!file) return;
+            try {
+                const resp = await fetch(`/api/skills/${this.skillName}/avatar`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': file.type },
+                    body: file,
+                });
+                if (resp.ok) {
+                    this.avatarUrl = `/api/skills/${this.skillName}/avatar?t=${Date.now()}`;
+                } else {
+                    const err = await resp.json();
+                    alert(err.detail || 'Upload failed');
+                }
+            } catch (e) {
+                alert('Upload error: ' + e.message);
+            }
+            event.target.value = '';
         },
 
         get categories() {
@@ -398,6 +478,38 @@ function expertAdmin() {
                 }
             } catch (e) {
                 alert('Error: ' + e.message);
+            }
+        },
+
+        async loadLearnInstructions() {
+            try {
+                const resp = await fetch(`/api/${this.skillName}/learn-instructions`);
+                if (resp.ok) {
+                    const data = await resp.json();
+                    this.learnInstructions = data.content || '';
+                }
+            } catch (e) {
+                console.error('Failed to load learn instructions:', e);
+            }
+        },
+
+        async saveLearnInstructions() {
+            this.learnSaveStatus = null;
+            try {
+                const resp = await fetch(`/api/${this.skillName}/learn-instructions`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: this.learnInstructions }),
+                });
+                if (resp.ok) {
+                    this.learnSaveStatus = 'saved';
+                    setTimeout(() => { this.learnSaveStatus = null; }, 3000);
+                } else {
+                    const err = await resp.json();
+                    this.learnSaveStatus = err.detail || 'Save failed';
+                }
+            } catch (e) {
+                this.learnSaveStatus = 'Error: ' + e.message;
             }
         },
     };
